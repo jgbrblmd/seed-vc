@@ -4,7 +4,16 @@ import torch
 import yaml
 import soundfile as sf
 import time
+import warnings
 from modules.commons import str2bool
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Set ROCm compatibility environment variables
+if os.system("rocm-smi > /dev/null 2>&1") == 0:
+    os.environ["AMD_SERIALIZE_KERNEL"] = "3"
+    os.environ["HIP_LAUNCH_BLOCKING"] = "1"
+    print("ROCm detected, enabling compatibility mode")
 
 # Set up device and torch configurations
 if torch.cuda.is_available():

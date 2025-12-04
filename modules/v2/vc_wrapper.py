@@ -145,11 +145,65 @@ class VoiceConversionWrapper(torch.nn.Module):
             reduced_token_seq: (T')
             reduced_token_seq_len: T'
         """
-        n_gram_seq = token_seq.unfold(0, n_gram, 1)
-        mask = torch.all(n_gram_seq[1:] != n_gram_seq[:-1], dim=1)
-        reduced_token_seq = torch.cat(
-            (n_gram_seq[0, :n_gram], n_gram_seq[1:, -1][mask])
-        )
+        # ROCm/HIP compatible implementation
+        try:
+            # First try the original implementation (works on CUDA/CPU)
+            n_gram_seq = token_seq.unfold(0, n_gram, 1)
+            mask = torch.all(n_gram_seq[1:] != n_gram_seq[:-1], dim=1)
+            reduced_token_seq = torch.cat(
+                (n_gram_seq[0, :n_gram], n_gram_seq[1:, -1][mask])
+            )
+        except (RuntimeError, Exception) as e:
+            # Fallback for ROCm/HIP or other compatibility issues
+            if "HIP" in str(e) or token_seq.is_cuda:
+                print(f"Using ROCm-compatible fallback for duration reduction: {str(e)}")
+
+            if n_gram == 1:
+                # For n_gram=1, just remove consecutive duplicates
+                if len(token_seq) == 0:
+                    return token_seq, 0
+
+                # Move to CPU for processing to avoid GPU kernel issues
+                device_original = token_seq.device
+                token_seq_cpu = token_seq.cpu()
+
+                reduced_tokens = [token_seq_cpu[0]]
+                for i in range(1, len(token_seq_cpu)):
+                    if token_seq_cpu[i] != token_seq_cpu[i-1]:
+                        reduced_tokens.append(token_seq_cpu[i])
+
+                reduced_token_seq = torch.tensor(reduced_tokens, device=device_original, dtype=token_seq.dtype)
+            else:
+                # For n_gram > 1, use a simpler approach
+                if len(token_seq) < n_gram:
+                    return token_seq, len(token_seq)
+
+                # Move to CPU for processing
+                device_original = token_seq.device
+                token_seq_cpu = token_seq.cpu()
+
+                # Collect unique n-grams
+                ngrams = []
+                i = 0
+                while i <= len(token_seq_cpu) - n_gram:
+                    current_gram = token_seq_cpu[i:i+n_gram]
+                    if not ngrams or not torch.equal(current_gram, ngrams[-1]):
+                        ngrams.append(current_gram)
+                    i += 1
+
+                if ngrams:
+                    reduced_token_seq_cpu = torch.stack(ngrams)
+                    # Take the first n-gram elements and the last element of each subsequent n-gram
+                    result_parts = [reduced_token_seq_cpu[0]]
+                    if len(reduced_token_seq_cpu) > 1:
+                        result_parts.extend([reduced_token_seq_cpu[i][-1] for i in range(1, len(reduced_token_seq_cpu))])
+                    reduced_token_seq = torch.stack(result_parts) if len(result_parts) > 1 else result_parts[0].unsqueeze(0)
+                else:
+                    reduced_token_seq = token_seq_cpu[:0]
+
+                # Move back to original device
+                reduced_token_seq = reduced_token_seq.to(device_original)
+
         return reduced_token_seq, len(reduced_token_seq)
         
     @staticmethod
