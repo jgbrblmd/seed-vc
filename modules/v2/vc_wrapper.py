@@ -4,6 +4,9 @@ import torchaudio
 import numpy as np
 from pydub import AudioSegment
 from hf_utils import load_custom_model_from_hf
+import webrtcvad
+import os
+import tempfile
 
 DEFAULT_REPO_ID = "Plachta/Seed-VC"
 DEFAULT_CFM_CHECKPOINT = "v2/cfm_small.pth"
@@ -48,8 +51,8 @@ class VoiceConversionWrapper(torch.nn.Module):
         self.bitrate = "320k"
         self.compiled_decode_fn = None
         self.dit_compiled = False
-        self.dit_max_context_len = 30  # in seconds
-        self.ar_max_content_len = 1500  # in num of narrow tokens
+        self.dit_max_context_len = 240  # in seconds
+        self.ar_max_content_len = 12000  # in num of narrow tokens
         self.compile_len = 87 * self.dit_max_context_len
 
     def forward_cfm(self, content_indices_wide, content_lens, mels, mel_lens, style_vectors):
@@ -217,8 +220,186 @@ class VoiceConversionWrapper(torch.nn.Module):
             chunk2[:overlap] = chunk2[:overlap] * fade_in + chunk1[-overlap:] * fade_out
         return chunk2
 
-    def _stream_wave_chunks(self, vc_wave, processed_frames, vc_mel, overlap_wave_len, 
-                           generated_wave_chunks, previous_chunk, is_last_chunk, stream_output):
+    def load_audio(self, audio_path, sr=22050):
+        """Load audio file, supporting various formats."""
+        try:
+            # First try loading with librosa (supports wav, flac, mp3, etc.)
+            audio, orig_sr = librosa.load(audio_path, sr=sr)
+            return audio
+        except Exception as e:
+            print(f"Failed to load with librosa: {e}")
+            try:
+                # Fallback to torchaudio
+                audio, orig_sr = torchaudio.load(audio_path)
+                if audio.shape[0] > 1:  # Convert stereo to mono
+                    audio = torch.mean(audio, dim=0)
+                audio = librosa.resample(audio.numpy(), orig_sr=orig_sr, target_sr=sr)
+                return audio
+            except Exception as e2:
+                print(f"Failed to load with torchaudio: {e2}")
+                try:
+                    # Last resort: use pydub for MP3 and other formats
+                    audio_segment = AudioSegment.from_file(audio_path)
+                    # Convert to mono
+                    if audio_segment.channels > 1:
+                        audio_segment = audio_segment.set_channels(1)
+                    # Convert to numpy array
+                    audio = np.array(audio_segment.get_array_of_samples(), dtype=np.float32) / 32768.0
+                    # Resample if needed
+                    if audio_segment.frame_rate != sr:
+                        audio = librosa.resample(audio, orig_sr=audio_segment.frame_rate, target_sr=sr)
+                    return audio
+                except Exception as e3:
+                    print(f"Failed to load with pydub: {e3}")
+                    raise Exception(f"Could not load audio file {audio_path}")
+
+    def save_audio(self, audio_array, output_path, format="wav", sr=None):
+        """Save audio in specified format."""
+        if sr is None:
+            sr = self.sr
+
+        try:
+            # Normalize audio to prevent clipping and improve quality
+            audio_array_norm = audio_array / (np.abs(audio_array).max() + 1e-8) * 0.95
+            audio_int16 = (audio_array_norm * 32767).astype(np.int16)
+
+            if format.lower() == "wav":
+                torchaudio.save(output_path, torch.from_numpy(audio_int16).float().unsqueeze(0), sr)
+            elif format.lower() == "mp3":
+                # Use pydub for MP3 with high quality
+                audio_segment = AudioSegment(
+                    audio_int16.tobytes(),
+                    frame_rate=sr,
+                    sample_width=audio_int16.dtype.itemsize,
+                    channels=1
+                )
+                audio_segment.export(output_path, format="mp3", bitrate="320k")
+            elif format.lower() == "ogg":
+                # Use pydub for OGG with explicit codec
+                audio_segment = AudioSegment(
+                    audio_int16.tobytes(),
+                    frame_rate=sr,
+                    sample_width=audio_int16.dtype.itemsize,
+                    channels=1
+                )
+                try:
+                    audio_segment.export(output_path, format="ogg", codec="libvorbis")
+                except Exception as e:
+                    print(f"Failed to export OGG with libvorbis codec, trying fallback: {e}")
+                    # Fallback method
+                    try:
+                        audio_segment.export(output_path, format="ogg")
+                    except Exception as e2:
+                        print(f"OGG export failed completely: {e2}")
+                        raise Exception(f"Could not save OGG file: {e2}")
+            else:
+                raise ValueError(f"Unsupported format: {format}")
+
+        except Exception as e:
+            print(f"Failed to save audio: {e}")
+            raise
+
+    def _find_optimal_split_points(self, audio, max_chunk_duration=240, min_chunk_duration=30,
+                                 overlap_duration=5, vad_aggressiveness=3):
+        """
+        Find optimal split points in audio for seamless processing.
+
+        Args:
+            audio: Audio array
+            max_chunk_duration: Maximum duration per chunk in seconds
+            min_chunk_duration: Minimum duration per chunk in seconds
+            overlap_duration: Overlap between chunks in seconds
+            vad_aggressiveness: VAD aggressiveness (0-3)
+
+        Returns:
+            List of (start, end) tuples for each chunk
+        """
+        sample_rate = self.sr
+        audio_len = len(audio)
+
+        # Convert frame counts
+        max_chunk_frames = int(max_chunk_duration * sample_rate)
+        min_chunk_frames = int(min_chunk_duration * sample_rate)
+        overlap_frames = int(overlap_duration * sample_rate)
+
+        split_points = []
+        current_pos = 0
+
+        # Use VAD to find silence/speech transitions
+        try:
+            # Downsample to 16kHz for VAD
+            audio_16k = librosa.resample(audio, orig_sr=sample_rate, target_sr=16000)
+
+            # Initialize VAD
+            vad = webrtcvad.Vad(vad_aggressiveness)
+
+            # Process audio in 30ms frames
+            frame_duration = 30  # ms
+            frame_samples = int(16000 * frame_duration / 1000)
+
+            frames = []
+            for i in range(0, len(audio_16k), frame_samples):
+                frame = audio_16k[i:i + frame_samples]
+                if len(frame) == frame_samples:
+                    frames.append(frame)
+
+            # Get VAD decisions
+            speech_frames = []
+            for i, frame in enumerate(frames):
+                is_speech = vad.is_speech(frame.tobytes(), 16000)
+                speech_frames.append(is_speech)
+
+            # Find good split points (silence regions)
+            silence_start_points = []
+            in_speech = False
+            silence_start = 0
+
+            for i, is_speech in enumerate(speech_frames):
+                frame_time = i * frame_duration / 1000 * sample_rate  # Convert to original sample rate
+
+                if not is_speech and not in_speech:
+                    silence_start = frame_time
+                    in_speech = True
+                elif is_speech and in_speech:
+                    silence_duration = frame_time - silence_start
+                    if silence_duration > 0.5:  # At least 0.5 seconds of silence
+                        silence_start_points.append(silence_start)
+                    in_speech = False
+
+        except Exception as e:
+            print(f"VAD processing failed, using fallback splitting: {e}")
+            silence_start_points = []
+
+        # Create chunks based on optimal split points
+        while current_pos < audio_len:
+            remaining_length = audio_len - current_pos
+
+            if remaining_length <= max_chunk_frames:
+                # Last chunk
+                split_points.append((current_pos, audio_len))
+                break
+            else:
+                # Find the best split point within the max chunk duration
+                chunk_end = current_pos + max_chunk_frames
+
+                # Try to split at a silence point
+                best_split_point = None
+                for silence_point in silence_start_points:
+                    if current_pos + min_chunk_frames <= silence_point <= chunk_end:
+                        best_split_point = int(silence_point)
+                        break
+
+                if best_split_point is None:
+                    # No good silence point, use overlapping split
+                    best_split_point = chunk_end - overlap_frames
+
+                split_points.append((current_pos, best_split_point))
+                current_pos = best_split_point - overlap_frames
+
+        return split_points
+
+    def _stream_wave_chunks(self, vc_wave, processed_frames, vc_mel, overlap_wave_len,
+                           generated_wave_chunks, previous_chunk, is_last_chunk, stream_output, output_format="wav"):
         """
         Helper method to handle streaming wave chunks.
         
@@ -247,16 +428,21 @@ class VoiceConversionWrapper(torch.nn.Module):
                 generated_wave_chunks.append(output_wave)
 
                 if stream_output:
-                    output_wave_int16 = (output_wave * 32768.0).astype(np.int16)
-                    mp3_bytes = AudioSegment(
+                    # Normalize audio to prevent clipping and pops
+                    output_wave_norm = output_wave / (np.abs(output_wave).max() + 1e-8) * 0.95
+                    output_wave_int16 = (output_wave_norm * 32767.0).astype(np.int16)
+                    audio_segment = AudioSegment(
                         output_wave_int16.tobytes(), frame_rate=self.sr,
                         sample_width=output_wave_int16.dtype.itemsize, channels=1
-                    ).export(format="mp3", bitrate=self.bitrate).read()
+                    )
+                    # Use the specified format, default to mp3 for streaming
+                    stream_format = "mp3" if output_format == "wav" else output_format
+                    output_bytes = audio_segment.export(format=stream_format, bitrate=self.bitrate).read()
                     full_audio = (self.sr, np.concatenate(generated_wave_chunks))
                 else:
                     return processed_frames, previous_chunk, True, None, np.concatenate(generated_wave_chunks)
 
-                return processed_frames, previous_chunk, True, mp3_bytes, full_audio
+                return processed_frames, previous_chunk, True, output_bytes, full_audio
 
             output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
             generated_wave_chunks.append(output_wave)
@@ -264,11 +450,15 @@ class VoiceConversionWrapper(torch.nn.Module):
             processed_frames += vc_mel.size(2) - self.overlap_frame_len
 
             if stream_output:
-                output_wave_int16 = (output_wave * 32768.0).astype(np.int16)
-                mp3_bytes = AudioSegment(
+                # Normalize audio to prevent clipping and pops
+                output_wave_norm = output_wave / (np.abs(output_wave).max() + 1e-8) * 0.95
+                output_wave_int16 = (output_wave_norm * 32767.0).astype(np.int16)
+                audio_segment = AudioSegment(
                     output_wave_int16.tobytes(), frame_rate=self.sr,
                     sample_width=output_wave_int16.dtype.itemsize, channels=1
-                ).export(format="mp3", bitrate=self.bitrate).read()
+                )
+                stream_format = "mp3" if output_format == "wav" else output_format
+                output_bytes = audio_segment.export(format=stream_format, bitrate=self.bitrate).read()
 
         elif is_last_chunk:
             output_wave = self.crossfade(previous_chunk.cpu().numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
@@ -276,16 +466,20 @@ class VoiceConversionWrapper(torch.nn.Module):
             processed_frames += vc_mel.size(2) - self.overlap_frame_len
 
             if stream_output:
-                output_wave_int16 = (output_wave * 32768.0).astype(np.int16)
-                mp3_bytes = AudioSegment(
+                # Normalize audio to prevent clipping and pops
+                output_wave_norm = output_wave / (np.abs(output_wave).max() + 1e-8) * 0.95
+                output_wave_int16 = (output_wave_norm * 32767.0).astype(np.int16)
+                audio_segment = AudioSegment(
                     output_wave_int16.tobytes(), frame_rate=self.sr,
                     sample_width=output_wave_int16.dtype.itemsize, channels=1
-                ).export(format="mp3", bitrate=self.bitrate).read()
+                )
+                stream_format = "mp3" if output_format == "wav" else output_format
+                output_bytes = audio_segment.export(format=stream_format, bitrate=self.bitrate).read()
                 full_audio = (self.sr, np.concatenate(generated_wave_chunks))
             else:
                 return processed_frames, previous_chunk, True, None, np.concatenate(generated_wave_chunks)
 
-            return processed_frames, previous_chunk, True, mp3_bytes, full_audio
+            return processed_frames, previous_chunk, True, output_bytes, full_audio
 
         else:
             output_wave = self.crossfade(previous_chunk.cpu().numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(), overlap_wave_len)
@@ -294,13 +488,17 @@ class VoiceConversionWrapper(torch.nn.Module):
             processed_frames += vc_mel.size(2) - self.overlap_frame_len
 
             if stream_output:
-                output_wave_int16 = (output_wave * 32768.0).astype(np.int16)
-                mp3_bytes = AudioSegment(
+                # Normalize audio to prevent clipping and pops
+                output_wave_norm = output_wave / (np.abs(output_wave).max() + 1e-8) * 0.95
+                output_wave_int16 = (output_wave_norm * 32767.0).astype(np.int16)
+                audio_segment = AudioSegment(
                     output_wave_int16.tobytes(), frame_rate=self.sr,
                     sample_width=output_wave_int16.dtype.itemsize, channels=1
-                ).export(format="mp3", bitrate=self.bitrate).read()
+                )
+                stream_format = "mp3" if output_format == "wav" else output_format
+                output_bytes = audio_segment.export(format=stream_format, bitrate=self.bitrate).read()
                 
-        return processed_frames, previous_chunk, False, mp3_bytes, full_audio
+        return processed_frames, previous_chunk, False, output_bytes, full_audio
 
     def load_checkpoints(
             self,
@@ -562,6 +760,7 @@ class VoiceConversionWrapper(torch.nn.Module):
             device: torch.device = torch.device("cuda"),
             dtype: torch.dtype = torch.float16,
             stream_output: bool = True,
+            output_format: str = "wav",
     ):
         """
         Convert voice with streaming support for long audio files.
@@ -584,12 +783,13 @@ class VoiceConversionWrapper(torch.nn.Module):
             If stream_output is True, yields (mp3_bytes, full_audio) tuples
             If stream_output is False, returns the full audio as a numpy array
         """
-        # Load audio
-        source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
-        target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
-        
-        # Limit target audio to 25 seconds
-        target_wave = target_wave[:self.sr * (self.dit_max_context_len - 5)]
+        # Load audio (supports various formats including MP3)
+        source_wave = self.load_audio(source_audio_path, sr=self.sr)
+        target_wave = self.load_audio(target_audio_path, sr=self.sr)
+
+        # Allow longer reference audio, up to 120 seconds
+        max_ref_len = min(len(target_wave), self.sr * 120)
+        target_wave = target_wave[:max_ref_len]
         
         source_wave_tensor = torch.tensor(source_wave).unsqueeze(0).float().to(device)
         target_wave_tensor = torch.tensor(target_wave).unsqueeze(0).float().to(device)
@@ -670,31 +870,56 @@ class VoiceConversionWrapper(torch.nn.Module):
                     )
                     vc_mel = vc_mel[:, :, target_mel_len:original_len]
                 vc_wave = self.vocoder(vc_mel).squeeze()[None]
-                processed_frames, previous_chunk, should_break, mp3_bytes, full_audio = self._stream_wave_chunks(
+                processed_frames, previous_chunk, should_break, output_bytes, full_audio = self._stream_wave_chunks(
                     vc_wave, processed_frames, vc_mel, overlap_wave_len,
-                    generated_wave_chunks, previous_chunk, is_last_chunk, stream_output
+                    generated_wave_chunks, previous_chunk, is_last_chunk, stream_output, output_format
                 )
 
-                if stream_output and mp3_bytes is not None:
-                    yield mp3_bytes, full_audio
+                if stream_output and output_bytes is not None:
+                    yield output_bytes, full_audio
                 if should_break:
                     break
         else:
             cond, _ = self.cfm_length_regulator(source_content_indices, ylens=torch.LongTensor([source_mel_len]).to(device))
 
-            # Process in chunks for streaming
+            # Use intelligent splitting for seamless processing
             max_source_window = max_context_window - target_mel.size(2)
 
-            # Generate chunk by chunk and stream the output
-            while processed_frames < cond.size(1):
-                chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
-                is_last_chunk = processed_frames + max_source_window >= cond.size(1)
+            # Get intelligent split points based on audio content
+            source_frames_per_cond = source_mel_len / cond.size(1)
+            max_chunk_duration_frames = max_source_window * source_frames_per_cond * self.hop_size
+            chunk_boundaries = self._find_optimal_split_points(
+                source_wave,
+                max_chunk_duration=max_chunk_duration_frames / self.sr,
+                min_chunk_duration=30,
+                overlap_duration=3
+            )
+
+            # Process each intelligent chunk
+            for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_boundaries):
+                # Convert frame boundaries to condition indices
+                chunk_start_frame = int(chunk_start / self.hop_size)
+                chunk_end_frame = int(chunk_end / self.hop_size)
+                chunk_start_cond = int(chunk_start_frame / source_frames_per_cond)
+                chunk_end_cond = int(chunk_end_frame / source_frames_per_cond)
+
+                # Ensure we don't exceed bounds
+                chunk_start_cond = max(0, chunk_start_cond)
+                chunk_end_cond = min(cond.size(1), chunk_end_cond)
+
+                if chunk_start_cond >= chunk_end_cond:
+                    continue
+
+                chunk_cond = cond[:, chunk_start_cond:chunk_end_cond]
+                is_last_chunk = chunk_idx == len(chunk_boundaries) - 1
                 cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
                 original_len = cat_condition.size(1)
+
                 # pad cat_condition to compile_len
                 if self.dit_compiled:
                     cat_condition = torch.nn.functional.pad(cat_condition,
                                                             (0, 0, 0, self.compile_len - cat_condition.size(1),), value=0)
+
                 with torch.autocast(device_type=device.type, dtype=torch.float32):  # force CFM to use float32
                     # Voice Conversion
                     vc_mel = self.cfm.inference(
@@ -707,12 +932,26 @@ class VoiceConversionWrapper(torch.nn.Module):
                 vc_mel = vc_mel[:, :, target_mel_len:original_len]
                 vc_wave = self.vocoder(vc_mel).squeeze()[None]
 
-                processed_frames, previous_chunk, should_break, mp3_bytes, full_audio = self._stream_wave_chunks(
+                processed_frames, previous_chunk, should_break, output_bytes, full_audio = self._stream_wave_chunks(
                     vc_wave, processed_frames, vc_mel, overlap_wave_len,
-                    generated_wave_chunks, previous_chunk, is_last_chunk, stream_output
+                    generated_wave_chunks, previous_chunk, is_last_chunk, stream_output, output_format
                 )
-                
-                if stream_output and mp3_bytes is not None:
-                    yield mp3_bytes, full_audio
+
+                if stream_output and output_bytes is not None:
+                    yield output_bytes, full_audio
                 if should_break:
                     break
+
+        # If not streaming, save the full audio in the requested format
+        if not stream_output:
+            full_audio_array = np.concatenate(generated_wave_chunks)
+            if output_format.lower() != "wav":
+                # For non-wav formats, we need to save to a temp file and read back
+                with tempfile.NamedTemporaryFile(suffix=f".{output_format}", delete=False) as tmp_file:
+                    self.save_audio(full_audio_array, tmp_file.name, format=output_format)
+                    with open(tmp_file.name, "rb") as f:
+                        output_bytes = f.read()
+                    os.unlink(tmp_file.name)  # Clean up temp file
+                yield output_bytes, (self.sr, full_audio_array)
+            else:
+                yield None, (self.sr, full_audio_array)

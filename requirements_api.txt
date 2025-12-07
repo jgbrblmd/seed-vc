@@ -1,0 +1,21 @@
+# Seed Voice Conversion V2 API Requirements
+
+# Core API framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+
+# Data validation and serialization
+pydantic>=2.0.0
+
+# File upload support
+python-multipart>=0.0.6
+
+# HTTP client (for examples)
+requests>=2.31.0
+
+# Optional: Performance monitoring
+# prometheus-client>=0.17.0
+# opentelemetry-api>=1.20.0
+
+# Note: The following packages should already be installed for the base functionality:
+# torch, torchaudio, librosa, pydub, numpy, hydra-core, omegaconf
